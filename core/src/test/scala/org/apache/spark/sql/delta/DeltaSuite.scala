@@ -19,6 +19,10 @@ package org.apache.spark.sql.delta
 import java.io.{File, FileNotFoundException}
 import java.util.concurrent.atomic.AtomicInteger
 
+import scala.collection.JavaConverters._
+import scala.concurrent.{Await, Future}
+import scala.concurrent.duration.Duration
+
 // scalastyle:off import.ordering.noEmptyLine
 import org.apache.spark.sql.delta.actions.{CommitInfo, Protocol}
 import org.apache.spark.sql.delta.files.TahoeLogFileIndex
@@ -39,7 +43,7 @@ import org.apache.spark.sql.execution.streaming.MemoryStream
 import org.apache.spark.sql.functions.struct
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.test.{SharedSparkSession, SQLTestUtils}
-import org.apache.spark.sql.types.StructType
+import org.apache.spark.sql.types.{StringType, StructField, StructType}
 import org.apache.spark.util.Utils
 
 class DeltaSuite extends QueryTest
@@ -1288,6 +1292,44 @@ class DeltaSuite extends QueryTest
         .mode("overwrite")
         .saveAsTable(table)
       checkAnswer(sql(s"SELECT `a.b`, `c.d`, a.b from $table"), Row("a", "b", "c") :: Nil)
+    }
+  }
+
+  test("concurrent writes") {
+    withTempDir { tempDir =>
+      import scala.concurrent.ExecutionContext.Implicits.global
+
+      val testPath = tempDir.getCanonicalPath
+
+      def write(partition: String, columns: String*): Unit = {
+        val df = spark.createDataFrame(
+          Seq(Row.fromSeq(partition +: columns)).asJava,
+          StructType(("part" +: columns).map(StructField(_, StringType, true)))
+        )
+
+        df.write
+          .format("delta")
+          .option("replaceWhere", s"part = '${partition}'")
+          .partitionBy("part")
+          .mode("overwrite")
+          .save(testPath)
+      }
+
+      write("a", "x")
+
+      Await.result(
+        Future.sequence(Seq(
+          Future(write("b", "x")),
+          Future(write("c", "x")),
+          Future(write("d", "x"))
+        )),
+        Duration.Inf
+      )
+
+      val ds = spark.read.format("delta").load(testPath).as[(String, String)]
+      checkDatasetUnorderly(
+        ds, "a" -> "x", "b" -> "x", "c" -> "x", "d" -> "x"
+      )
     }
   }
 }
